@@ -6,6 +6,7 @@
 
 **Jeongwan Shin**, **Jaehyeon Kim**, **Donguk Ko**, **Jaeho Choi**
 DGIST · KAIST InnoCORE LLM
+
 🌐 Project page: https://mmwave-qa.github.io/
 
 ---
