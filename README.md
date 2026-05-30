@@ -127,10 +127,12 @@ The processor writes a combined JSON response file and logs progress under `log/
 If you find mmWave-QA useful, please cite:
 
 ```bibtex
-@inproceedings{shin2026mmwaveqa,
-  title     = {Can Language Models Understand mmWave Data? Benchmarking Large Language Models for mmWave Radar-Based Human Understanding},
-  author    = {Shin, Jeongwan and Kim, Jaehyeon and Ko, Donguk and Choi, Jaeho},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Findings},
-  year      = {2026}
+@InProceedings{Shin_2026_CVPR,
+    author    = {Shin, Jeongwan and Kim, Jaehyeon and Ko, Donguk and Choi, Jaeho},
+    title     = {Can Language Models Understand mmWave Data? Benchmarking Large Language Models for mmWave Radar-Based Human Understanding},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Findings},
+    month     = {June},
+    year      = {2026},
+    pages     = {2208-2219}
 }
 ```
