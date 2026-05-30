@@ -6,14 +6,15 @@ import csv
 import re
 import argparse
 import random
+import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 
 LABELS_DIR = "/workspace/mmWave/data/mRI/mRI/dataset_release/raw_data/videolabels"
 RADAR_DIR = "/workspace/mmWave/data/mRI/mRI/dataset_release/raw_data/radar"
+MMBODY_RADAR_DIR = "/workspace/mmWave/data/mmbody/filtered_radar/mmBody_filtering"
 OUTPUT_ROOT = "/workspace/mmWave/mmWaveQA_benchmark"
-
 
 
 class BaseGenerator:
@@ -23,16 +24,17 @@ class BaseGenerator:
         self.output_root = output_root
         # Default pose rename mapping; child classes may override
         self.pose_rename = {
-            "pose_1": "left upper limb extension",
-            "pose_2": "right upper limb extension",
-            "pose_3": "both upper limb extension",
-            "pose_4": "left front lunge",
-            "pose_5": "right front lunge",
-            "pose_6": "squat",
-            "pose_7": "left side lunge",
-            "pose_8": "right side lunge",
-            "pose_9": "left limb extension",
-            "pose_10": "right limb",
+            "pose_1": "left upper limb extension", # single upper-limb lateral extension
+            "pose_2": "right upper limb extension", # single upper-limb lateral extension
+            "pose_3": "both upper limb extension", # both upper-limb lateral extension
+            "pose_4": "left front lunge", # front lunge
+            "pose_5": "right front lunge", # front lunge
+            "pose_6": "squat", # squat
+            "pose_7": "left side lunge", # side lunge
+            "pose_8": "right side lunge", # side lunge
+            "pose_9": "left limb extension", # unilateral upper–lower limb extension
+            "pose_10": "right limb", # unilateral upper–lower limb extension
+            "free_form": "free form",
         }
 
     def load_all_ranges(self, labels_path: str) -> Dict[str, Tuple[int, int]]:
@@ -83,8 +85,11 @@ class BaseGenerator:
                 if frame_idx < start or frame_idx >= end:
                     continue
                 try:
-                    x = float(row[2]); y = float(row[3]); z = float(row[4])
-                    doppler = float(row[5]); intensity = float(row[6])
+                    x = round(float(row[2]), 2)
+                    y = round(float(row[3]), 2)
+                    z = round(float(row[4]), 2)
+                    doppler = round(float(row[5]), 2)
+                    intensity = round(float(row[6]), 2)
                 except Exception:
                     continue
                 frames.setdefault(frame_idx, []).append([x, y, z, doppler, intensity])
@@ -95,17 +100,138 @@ class BaseGenerator:
 
 
 class MovementGenerator(BaseGenerator):
-    def __init__(self, output_root: str = OUTPUT_ROOT):
+    def __init__(self, output_root: str = OUTPUT_ROOT, data_type: str = "mRI", mmbody_radar_dir: str = MMBODY_RADAR_DIR):
         super().__init__(output_root=output_root)
-        self.output_dir = os.path.join(self.output_root, "movement")
-        self.question_input = [
-            "Has the person’s center position shifted in coordinates?",
-            "Did the person’s central point move based on their coordinates?",
-            "Is there a displacement of the person’s center position?",
-            "Has the person’s position centroid changed location?",
-            "Did the person’s spatial center move across coordinates?",
-            "Is the person’s central coordinate shifting over time?",
+        self.data_ver = "ver_2"
+        self.data_type = data_type  # "mRI" or "mmBody"
+        self.mmbody_radar_dir = mmbody_radar_dir
+        # 데이터 타입에 따라 출력 디렉토리 설정
+        self.output_dir = os.path.join(self.output_root, "movement", self.data_type)
+        
+        # mRI용 질문들
+        self.question_input_mri = [
+            "Did the person walk or change location, indicating a shift of the whole body's center position?",
+            "Has the person moved from one place to another rather than staying in the same spot?",
+            "Is there evidence of locomotion, such as walking, where the person's body center travels across coordinates?",
+            "Did the person's body centroid translate noticeably, consistent with walking or relocation?",
+            "Has the person shifted their overall position across frames, indicating actual movement through space?"
         ]
+        
+        # mmBody용 질문들
+        self.question_input_mmbody = [
+            "Did the person walk or change location, indicating a shift of the whole body's center position?",
+            "Has the person moved from one place to another rather than staying in the same spot?",
+            "Is there evidence of locomotion, such as walking, where the person's body center travels across coordinates?",
+            "Did the person's body centroid translate noticeably, consistent with walking or relocation?",
+            "Has the person shifted their overall position across frames, indicating actual movement through space?"
+        ]
+        
+        # 데이터 타입에 따라 적절한 질문 선택
+        if self.data_type == "mmBody":
+            self.question_input = self.question_input_mmbody
+        else:  # mRI
+            self.question_input = self.question_input_mri
+
+    def build_point_cloud_from_npy(self, seq_name: str, start: int, end: int, split: str = "train") -> Dict[str, List[List[float]]]:
+        """
+        mmBody 데이터의 npy 파일들로부터 point cloud를 생성합니다.
+        
+        Args:
+            seq_name: sequence 이름 (e.g., "sequence_8")
+            start: 시작 프레임 번호
+            end: 종료 프레임 번호
+            split: "train" 또는 "test"
+        
+        Returns:
+            Dict[str, List[List[float]]]: frame_XXXXXX -> [[x, y, z, doppler, intensity], ...]
+        """
+        seq_dir = os.path.join(self.mmbody_radar_dir, split, seq_name)
+        if not os.path.exists(seq_dir):
+            return {}
+        
+        pc: Dict[str, List[List[float]]] = {}
+        for frame_idx in range(start, end):
+            npy_path = os.path.join(seq_dir, f"frame_{frame_idx}.npy")
+            if not os.path.exists(npy_path):
+                continue
+            try:
+                data = np.load(npy_path)  # shape: (N, 6)
+                # x, y, z, doppler, intensity를 추출 (첫 5개 컬럼 사용)
+                points = []
+                for point in data:
+                    if len(point) >= 5:
+                        x = round(float(point[0]), 2)
+                        y = round(float(point[1]), 2)
+                        z = round(float(point[2]), 2)
+                        doppler = round(float(point[3]), 2)
+                        intensity = round(float(point[4]), 2)
+                        points.append([x, y, z, doppler, intensity])
+                if points:
+                    pc[f"frame_{frame_idx:06d}"] = points
+            except Exception as e:
+                # 파일 로드 실패 시 건너뜀
+                continue
+        
+        return pc
+
+    def _parse_mmbody_action_txt(self, action_txt_path: str) -> Dict[str, List[Tuple[int, int, str]]]:
+        sequences: Dict[str, List[Tuple[int, int, str]]] = {}
+        current_seq: Optional[str] = None
+        if not os.path.exists(action_txt_path):
+            return sequences
+        with open(action_txt_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("sequence_") and "~" not in line:
+                    current_seq = line
+                    sequences.setdefault(current_seq, [])
+                    continue
+                if current_seq is None:
+                    continue
+                m = re.match(r"(\d+)~(\d+)\s*:\s*(.+)$", line)
+                if not m:
+                    continue
+                start = int(m.group(1))
+                end = int(m.group(2))
+                label = m.group(3)
+                if "(Movement)" in label:
+                    sequences[current_seq].append((start, end, label))
+        return sequences
+
+    def run_mmbody(self, action_txt_path: str, split: str = "train") -> Tuple[int, int]:
+        os.makedirs(self.output_dir, exist_ok=True)
+        data = self._parse_mmbody_action_txt(action_txt_path)
+        saved = 0
+        skipped = 0
+        for seq_name, ranges in tqdm(data.items(), desc="Movement (mmBody): sequences"):
+            if not ranges:
+                skipped += 1
+                continue
+            seq_dir = os.path.join(self.output_dir, seq_name)
+            os.makedirs(seq_dir, exist_ok=True)
+            for idx, (start, end, label) in enumerate(ranges):
+                # mmBody 데이터에서 point cloud 로드
+                point_cloud = self.build_point_cloud_from_npy(seq_name, start, end, split=split)
+                
+                payload = {
+                    "benchmarkfrom": "mmBody",
+                    "sequence": seq_name,
+                    "action": label,
+                    "question_category": "movement",
+                    "question_type": "binary",
+                    "question_input": self.question_input,
+                    "frames": {"start": start, "end": end},
+                    "point_cloud": point_cloud,
+                }
+                safe_label = re.sub(r"[^A-Za-z0-9_\-]", "_", label)
+                out_path = os.path.join(seq_dir, f"movement_{idx:04d}_{start}_{end}_{safe_label}.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                saved += 1
+        print(f"[Movement (mmBody)] Saved {saved} files, skipped {skipped} sequences. Out: {self.output_dir}")
+        return saved, skipped
 
     def generate_subject_actions(self, subject_id: str) -> Dict[str, Dict]:
         labels_path = os.path.join(self.labels_dir, f"{subject_id}.json")
@@ -125,7 +251,7 @@ class MovementGenerator(BaseGenerator):
                 "subject": subj_label,
                 "action": action_out_name,
                 "question_category": "movement",
-                "question_subconcepts": "rgith left movement",
+                "question_subconcepts": "right left movement",
                 "question_type": "binary",
                 "question_input": self.question_input,
                 "point_cloud": point_cloud,
@@ -133,12 +259,24 @@ class MovementGenerator(BaseGenerator):
             outputs[action_out_name] = payload
         return outputs
 
-    def run(self) -> Tuple[int, int]:
+    def run(self, action_txt_path: str = None) -> Tuple[int, int]:
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        if self.data_type == "mmBody":
+            # mmBody 데이터 처리
+            if action_txt_path is None:
+                action_txt_path = "/workspace/mmWave/data/mmbody/annotation/action.txt"
+            return self.run_mmbody(action_txt_path)
+        else:
+            # mRI 데이터 처리
+            return self.run_mri()
+    
+    def run_mri(self) -> Tuple[int, int]:
+        """mRI 데이터를 처리하는 메서드"""
         label_files = sorted(glob.glob(os.path.join(self.labels_dir, "subject*.json")))
         saved = 0
         skipped = 0
-        for lf in tqdm(label_files, desc="Movement: subjects"):
+        for lf in tqdm(label_files, desc="Movement (mRI): subjects"):
             base = os.path.basename(lf)
             subject_id = base.replace(".json", "")
             subject_folder = self.subject_label(subject_id)
@@ -154,9 +292,8 @@ class MovementGenerator(BaseGenerator):
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
                 saved += 1
-        print(f"[Movement] Saved {saved} action files, skipped {skipped} subjects. Out: {self.output_dir}")
+        print(f"[Movement (mRI)] Saved {saved} action files, skipped {skipped} subjects. Out: {self.output_dir}")
         return saved, skipped
-
 
 class TemporalActionGenerator(BaseGenerator):
     def __init__(self, output_root: str = OUTPUT_ROOT, comb_len: int = 2):
@@ -208,20 +345,20 @@ class TemporalActionGenerator(BaseGenerator):
                 "What is the first action in this segment?",
                 "Identify the initial pose in this sequence.",
                 "Which action starts this segment?",
-                "At the beginning of this segment, what is the action?",
-                "Which pose appears first in this sequence?",
-                "What is the starting pose for this segment?",
+                "What is the last action in this segment?",
+                "Identify the final pose in this sequence.",
+                "Which action concludes this segment?",
             ]
             return q, answer
         if k == 3:
             answer = seq_names[1]
             q = [
+                "What is the first action in this segment?",
+                "Identify the initial pose in this sequence.",
                 "What is the middle action in this segment?",
-                "Identify the center pose in this three-action sequence.",
-                "Which action occurs between the first and the last?",
                 "At the midpoint of this segment, what is the action?",
-                "Which pose appears in the middle of the sequence?",
-                "What is the second action in this three-step sequence?",
+                "What is the last action in this segment?",
+                "Identify the final pose in this sequence.",
             ]
             return q, answer
         # k >= 4: ask for the last action
@@ -339,12 +476,14 @@ class TemporalActionGenerator(BaseGenerator):
         print(f"[Temporal] Saved {saved} files (comb={self.comb_len}), skipped {skipped} subjects. Out: {comb_dir}")
         return saved, skipped
 
-
 class CountingGenerator(BaseGenerator):
-    def __init__(self, output_root: str = OUTPUT_ROOT, comb_len: int = 2):
+    def __init__(self, output_root: str = OUTPUT_ROOT, comb_len: int = 1, data_type: str = "mRI", mmbody_radar_dir: str = MMBODY_RADAR_DIR, mm_actions_path: str = "/workspace/mmWave/mmWaveQA_benchmark/mm_actions2.json"):
         super().__init__(output_root=output_root)
         self.output_dir = os.path.join(self.output_root, "counting")
-        self.comb_len = max(2, int(comb_len))
+        self.comb_len = max(1, int(comb_len))
+        self.data_type = data_type  # "mRI" or "mmBody"
+        self.mmbody_radar_dir = mmbody_radar_dir
+        self.mm_actions_path = mm_actions_path
 
     def _sorted_actions(self, labels_path: str) -> List[Tuple[str, Tuple[int, int]]]:
         ranges = self.load_all_ranges(labels_path)
@@ -364,6 +503,46 @@ class CountingGenerator(BaseGenerator):
         end = seq[-1][1][1]
         return self.build_point_cloud_from_csv(csv_path, start, end)
 
+    # mmBody: build point cloud from npy frames
+    def build_point_cloud_from_npy(self, seq_name: str, start: int, end: int, split: str = "train") -> Dict[str, List[List[float]]]:
+        # Resolve directory: train -> train/sequence_X; test -> test/<env>/sequence_X
+        seq_dir: str
+        if split == "train":
+            seq_dir = os.path.join(self.mmbody_radar_dir, "train", seq_name)
+        else:
+            # Known test environments
+            env_prefixes = ("furnished", "lab1", "lab2", "occlusion", "poor_lighting", "rain", "smoke")
+            m = re.match(r"^(?P<env>" + "|".join(env_prefixes) + r")_sequence_(?P<idx>\d+)$", seq_name)
+            if m:
+                env = m.group("env")
+                seq_dir = os.path.join(self.mmbody_radar_dir, "test", env, f"sequence_{m.group('idx')}")
+            else:
+                # Fallback: test/sequence_X (if already flat)
+                seq_dir = os.path.join(self.mmbody_radar_dir, "test", seq_name)
+        if not os.path.exists(seq_dir):
+            return {}
+        pc: Dict[str, List[List[float]]] = {}
+        for frame_idx in range(start, end):
+            npy_path = os.path.join(seq_dir, f"frame_{frame_idx}.npy")
+            if not os.path.exists(npy_path):
+                continue
+            try:
+                data = np.load(npy_path)
+                points: List[List[float]] = []
+                for point in data:
+                    if len(point) >= 5:
+                        x = round(float(point[0]), 2)
+                        y = round(float(point[1]), 2)
+                        z = round(float(point[2]), 2)
+                        doppler = round(float(point[3]), 2)
+                        intensity = round(float(point[4]), 2)
+                        points.append([x, y, z, doppler, intensity])
+                if points:
+                    pc[f"frame_{frame_idx:06d}"] = points
+            except Exception:
+                continue
+        return pc
+
     def _qa_counting(self, seq_names: List[str]) -> Tuple[List[str], int]:
         # Count distinct actions in the window
         distinct = len(set(seq_names))
@@ -378,6 +557,11 @@ class CountingGenerator(BaseGenerator):
         return q, distinct
 
     def run(self) -> Tuple[int, int]:
+        if self.data_type == "mmBody":
+            return self.run_mmbody()
+        return self.run_mri()
+
+    def run_mri(self) -> Tuple[int, int]:
         os.makedirs(self.output_dir, exist_ok=True)
         comb_dir = os.path.join(self.output_dir, f"comb_{self.comb_len}")
         os.makedirs(comb_dir, exist_ok=True)
@@ -443,20 +627,96 @@ class CountingGenerator(BaseGenerator):
         print(f"[Counting] Saved {saved} files (comb={self.comb_len}), skipped {skipped} subjects. Out: {comb_dir}")
         return saved, skipped
 
+    def run_mmbody(self) -> Tuple[int, int]:
+        # Output to counting/mmBody/comb_k
+        base_dir = os.path.join(self.output_root, "counting", "mmBody")
+        comb_dir = os.path.join(base_dir, f"comb_{self.comb_len}")
+        os.makedirs(comb_dir, exist_ok=True)
+
+        # Load mm_actions2.json and collect mmBody actions by sequence
+        try:
+            with open(self.mm_actions_path, "r", encoding="utf-8") as f:
+                actions_all = json.load(f)
+        except Exception:
+            print(f"Failed to load mmBody actions from {self.mm_actions_path}")
+            return 0, 0
+
+        seq_to_items: Dict[Tuple[str, str], List[Tuple[str, Tuple[int, int]]]] = {}
+        for item in actions_all:
+            info = item.get("info", {})
+            if info.get("from") != "mmbody":
+                continue
+            seg = info.get("segment")
+            mode = info.get("mode", "train")
+            frames = item.get("frames", {})
+            s = int(frames.get("start", 0))
+            e = int(frames.get("end", 0))
+            if not seg or e <= s:
+                continue
+            action = item.get("action", "")
+            seq_to_items.setdefault((seg, mode), []).append((action, (s, e)))
+
+        saved = 0
+        skipped = 0
+        safe_re = re.compile(r"[^A-Za-z0-9_\-~]")
+        for (seq_name, mode), items in tqdm(seq_to_items.items(), desc="Counting (mmBody): sequences"):
+            if not items:
+                skipped += 1
+                continue
+            items.sort(key=lambda kv: kv[1][0])
+            windows = self._window_sequences(items)
+            if not windows:
+                skipped += 1
+                continue
+            seq_dir = os.path.join(comb_dir, seq_name)
+            os.makedirs(seq_dir, exist_ok=True)
+            for idx, window in enumerate(tqdm(windows, desc=f"{seq_name}: windows", leave=False)):
+                seq_names_raw = [name for name, _ in window]
+                pc = self.build_point_cloud_from_npy(seq_name, window[0][1][0], window[-1][1][1], split=mode)
+                q_list, distinct = self._qa_counting(seq_names_raw)
+                options = ["A. 1", "B. 2", "C. 3", "D. 4"]
+                correct_text = f"{distinct}"
+                action_seq_map = {name: [rng[0], rng[1]] for name, rng in window}
+                payload = {
+                    "benchmarkfrom": "mmBody",
+                    "sequence": seq_name,
+                    "action_sequence": action_seq_map,
+                    "action_sequence_desc": seq_names_raw,
+                    "question_category": "counting",
+                    "question_type": "4_options",
+                    "question_subcontexts": "count_distinct",
+                    "question_input": q_list,
+                    "options": options,
+                    "answer": correct_text,
+                    "point_cloud": pc,
+                }
+                seq_name_join = "~".join(seq_names_raw)
+                seq_name_safe = safe_re.sub("_", seq_name_join)
+                fname = f"seq_{idx:04d}_{seq_name_safe}_count.json"
+                out_path = os.path.join(seq_dir, fname)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                saved += 1
+
+        print(f"[Counting (mmBody)] Saved {saved} files, skipped {skipped} sequences. Out: {comb_dir}")
+        return saved, skipped
+
 def main():
     parser = argparse.ArgumentParser(description="Generate mmWave QA benchmark (movement, temporal, counting)")
     parser.add_argument("--task", choices=["movement", "temporal", "counting", "pipeline"], default="movement")
+    parser.add_argument("--data-type", choices=["mRI", "mmBody"], default="mRI", help="Data type for movement task")
     parser.add_argument("--labels-dir", type=str, default=LABELS_DIR)
     parser.add_argument("--radar-dir", type=str, default=RADAR_DIR)
     parser.add_argument("--output-root", type=str, default=OUTPUT_ROOT)
-    parser.add_argument("--comb-len", type=int, default=2, help="Temporal combination length (2, 3, or 4)")
+    parser.add_argument("--comb-len", type=int, default=2, help="Temporal/Counting combination length (1, 2, 3, or 4)")
+    parser.add_argument("--mmbody-action-path", type=str, default="/workspace/mmWave/data/mmbody/annotation/action.txt")
     args = parser.parse_args()
 
     if args.task in ("movement", "pipeline"):
-        mg = MovementGenerator(output_root=args.output_root)
+        mg = MovementGenerator(output_root=args.output_root, data_type=args.data_type)
         mg.labels_dir = args.labels_dir
         mg.radar_dir = args.radar_dir
-        mg.run()
+        mg.run(action_txt_path=args.mmbody_action_path)
 
     if args.task in ("temporal", "pipeline"):
         tg = TemporalActionGenerator(output_root=args.output_root, comb_len=args.comb_len)
@@ -465,11 +725,10 @@ def main():
         tg.run()
 
     if args.task == "counting":
-        cg = CountingGenerator(output_root=args.output_root, comb_len=args.comb_len)
+        cg = CountingGenerator(output_root=args.output_root, comb_len=args.comb_len, data_type=args.data_type)
         cg.labels_dir = args.labels_dir
         cg.radar_dir = args.radar_dir
         cg.run()
-
 
 if __name__ == "__main__":
     main()
